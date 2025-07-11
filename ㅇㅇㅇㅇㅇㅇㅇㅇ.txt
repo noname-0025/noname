@@ -1,0 +1,834 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+import json
+from datetime import datetime, timedelta
+import os
+import hashlib
+import threading
+
+class LicenseManager:
+    """라이선스 키 관리 및 유효성 검사, 만료 시간 추적 클래스"""
+    def __init__(self):
+        # 라이선스 파일 경로 설정 (사용자 홈 디렉토리)
+        self.license_file = os.path.join(os.path.expanduser("~"), ".fifo_calculator_license.json")
+        # 유효한 라이선스 키 (실제 배포 시에는 더 복잡한 키 또는 외부 검증 사용 권장)
+        self.valid_license_key = "FIFO-CALC-2023"
+
+    def check_license(self):
+        """라이선스 파일 존재 여부 및 유효 기간 확인"""
+        if not os.path.exists(self.license_file):
+            return False  # 파일이 없으면 라이선스 없음
+
+        try:
+            with open(self.license_file, 'r') as f:
+                data = json.load(f)
+            # 만료일 파싱
+            expiry = datetime.strptime(data.get('expiry_date', ''), "%Y-%m-%d %H:%M:%S")
+            # 현재 시간이 만료일을 지났는지 확인
+            if datetime.now() > expiry:
+                messagebox.showwarning("라이선스 만료", "라이선스가 만료되었습니다. 라이선스 키를 다시 입력해주세요.")
+                return False  # 만료됨
+            return True  # 유효함
+        except Exception:
+            # 파일 손상 등 오류 발생 시 라이선스 없음으로 처리
+            return False
+
+    def validate_and_save(self, key):
+        """입력된 라이선스 키를 검증하고 유효하면 저장"""
+        if key == self.valid_license_key:
+            # 유효 기간 6개월 (180일) 설정
+            expiry_date = datetime.now() + timedelta(days=180)
+            data = {
+                'license_key': hashlib.sha256(key.encode()).hexdigest(), # 보안을 위해 해시값 저장
+                'issue_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'expiry_date': expiry_date.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            try:
+                with open(self.license_file, 'w') as f:
+                    json.dump(data, f)
+                return True  # 저장 성공
+            except Exception:
+                return False # 저장 실패
+        else:
+            return False # 키 불일치
+
+    def get_remaining_time(self):
+        """남은 라이선스 유효 기간을 일, 시간, 분, 초로 반환"""
+        try:
+            with open(self.license_file, 'r') as f:
+                data = json.load(f)
+            expiry = datetime.strptime(data.get('expiry_date', ''), "%Y-%m-%d %H:%M:%S")
+            now = datetime.now()
+            if expiry > now:
+                delta = expiry - now
+                days = delta.days
+                hours, remainder = divmod(delta.seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                return days, hours, minutes, seconds
+            else:
+                return 0, 0, 0, 0 # 만료되었거나 오류
+        except Exception:
+            return 0, 0, 0, 0 # 오류 발생 시 0 반환
+
+class FIFOCalculator:
+    """선입선출(FIFO) 재화 계산기 메인 애플리케이션 클래스"""
+    def __init__(self, root):
+        self.root = root
+        self.root.title("선입선출(FIFO) 재화 계산기")
+        self.root.geometry("900x750")
+        self.center_window() # 창을 화면 중앙에 배치
+
+        self.license_manager = LicenseManager()
+        # 프로그램 시작 시 라이선스 체크
+        if not self.check_license_on_startup():
+            self.root.destroy() # 라이선스 없거나 유효하지 않으면 프로그램 종료
+            return
+
+        # 데이터 구조 초기화
+        self.charges = []      # [id, time, amount, remaining]
+        self.purchases = []    # [id, time, amount, used_charges_dict]
+        self.refunds = []      # [id, time, amount, target_purchase_id]
+
+        self.create_ui() # 사용자 인터페이스 생성
+        self.load_data() # 저장된 데이터 로드
+        self.create_footer() # 푸터 생성
+        self.update_license_timer() # 라이선스 타이머 시작
+
+    def center_window(self):
+        """창을 화면 중앙에 배치하는 함수"""
+        self.root.update_idletasks() # UI 요소들이 완전히 렌더링되도록 업데이트
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        ws = self.root.winfo_screenwidth()
+        hs = self.root.winfo_screenheight()
+        x = (ws // 2) - (w // 2)
+        y = (hs // 2) - (h // 2)
+        self.root.geometry(f'{w}x{h}+{x}+{y}')
+
+    def check_license_on_startup(self):
+        """프로그램 시작 시 라이선스 유효성 검사 및 키 입력 처리"""
+        if not self.license_manager.check_license():
+            key = simpledialog.askstring("라이선스 키 입력", "라이선스 키를 입력하세요:", parent=self.root)
+            if not key:
+                messagebox.showerror("오류", "라이선스 키가 입력되지 않아 실행할 수 없습니다.")
+                return False
+            if not self.license_manager.validate_and_save(key):
+                messagebox.showerror("오류", "유효하지 않은 라이선스 키입니다.")
+                return False
+            messagebox.showinfo("성공", "라이선스가 등록되었습니다. 6개월간 사용 가능합니다.")
+        return True
+
+    def update_license_timer(self):
+        """라이선스 만료까지 남은 시간을 타이틀 바에 표시하고 업데이트"""
+        days, hours, minutes, seconds = self.license_manager.get_remaining_time()
+        if days == 0 and hours == 0 and minutes == 0 and seconds == 0:
+            messagebox.showwarning("라이선스 만료", "라이선스가 만료되어 프로그램을 종료합니다.")
+            self.root.destroy() # 라이선스 만료 시 프로그램 종료
+            return
+        # 타이틀 바에 남은 시간 표시
+        self.root.title(f"선입선출(FIFO) 재화 계산기 - 라이선스 만료까지 {days}일 {hours}시간 {minutes}분 {seconds}초")
+        self.root.after(1000, self.update_license_timer) # 1초마다 업데이트
+
+    def create_ui(self):
+        """모든 탭과 하단 버튼 프레임을 포함한 UI 구성"""
+        self.tab_control = ttk.Notebook(self.root)
+
+        # 각 탭 프레임 생성 및 추가
+        self.charge_tab = ttk.Frame(self.tab_control)
+        self.purchase_tab = ttk.Frame(self.tab_control)
+        self.refund_tab = ttk.Frame(self.tab_control)
+        self.result_tab = ttk.Frame(self.tab_control)
+        self.bulk_input_tab = ttk.Frame(self.tab_control)
+
+        self.tab_control.add(self.charge_tab, text="충전 내역")
+        self.tab_control.add(self.purchase_tab, text="구매 내역")
+        self.tab_control.add(self.refund_tab, text="청약철회 내역")
+        self.tab_control.add(self.result_tab, text="결과 확인")
+        self.tab_control.add(self.bulk_input_tab, text="자동 연산") # '일괄 입력'에서 '자동 연산'으로 변경
+
+        self.tab_control.pack(expand=1, fill="both")
+
+        # 각 탭의 세부 UI 설정 함수 호출
+        self.setup_charge_tab()
+        self.setup_purchase_tab()
+        self.setup_refund_tab()
+        self.setup_result_tab()
+        self.setup_bulk_input_tab()
+
+        # 하단 버튼 프레임 생성
+        btn_frame = ttk.Frame(self.root)
+        btn_frame.pack(pady=10)
+
+        # 하단 버튼들 생성 및 배치
+        ttk.Button(btn_frame, text="저장", command=self.save_data).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="불러오기", command=self.load_data).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="계산 실행", command=self.calculate_fifo_threaded).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="내역 초기화", command=self.clear_all_data).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="정보", command=self.show_about_dialog).pack(side=tk.LEFT, padx=5)
+
+    def create_footer(self):
+        """프로그램 하단에 제작자 정보 푸터 생성"""
+        self.footer_label = ttk.Label(self.root, text="제작: 정석진 (Seokjin.Jung) | 버전: 1.0.0 | Copyright © 2025. All rights reserved.", font=("맑은 고딕", 8))
+        self.footer_label.pack(side=tk.BOTTOM, pady=5)
+
+    def show_about_dialog(self):
+        """프로그램 정보 다이얼로그 표시"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("프로그램 정보")
+        dlg.geometry("350x220")
+        dlg.resizable(False, False)
+        dlg.transient(self.root) # 메인 윈도우 위에 유지
+        dlg.grab_set() # 모달 다이얼로그 (다른 창 조작 불가)
+
+        frame = ttk.Frame(dlg, padding=15)
+        frame.pack(expand=True, fill="both")
+
+        ttk.Label(frame, text="[선입선출 재화 계산기]", font=("맑은 고딕", 12, "bold")).pack(pady=5)
+        ttk.Label(frame, text="버전: 1.0.0").pack(pady=2)
+        ttk.Label(frame, text="제작: 정석진 (Seokjin.Jung)").pack(pady=2)
+        ttk.Label(frame, text="문의: seokjin.jung@tdcx.com").pack(pady=2)
+        ttk.Label(frame, text="유지/보수 : 퇴사 전까지", font=("맑은 고딕", 9)).pack(pady=2)
+        ttk.Label(frame, text="Copyright © 2025. All rights reserved.", font=("맑은 고딕", 8)).pack(pady=10)
+
+        ttk.Button(frame, text="닫기", command=dlg.destroy).pack(pady=5)
+        self.root.wait_window(dlg) # 다이얼로그가 닫힐 때까지 대기
+
+    # --- 충전 탭 관련 함수 ---
+    def setup_charge_tab(self):
+        """충전 내역 탭 UI 구성"""
+        input_frame = ttk.LabelFrame(self.charge_tab, text="충전 정보 입력")
+        input_frame.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(input_frame, text="충전 ID:").grid(row=0, column=0, padx=5, pady=5)
+        self.charge_id_entry = ttk.Entry(input_frame, width=20)
+        self.charge_id_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(input_frame, text="충전 시각 (YYYY-MM-DD HH:MM:SS KST):").grid(row=0, column=2, padx=5, pady=5)
+        self.charge_time_entry = ttk.Entry(input_frame, width=25)
+        self.charge_time_entry.grid(row=0, column=3, padx=5, pady=5)
+        self.charge_time_entry.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M:%S KST"))
+
+        ttk.Label(input_frame, text="충전 금액 (RP):").grid(row=0, column=4, padx=5, pady=5)
+        self.charge_amount_entry = ttk.Entry(input_frame, width=10)
+        self.charge_amount_entry.grid(row=0, column=5, padx=5, pady=5)
+
+        ttk.Button(input_frame, text="충전 추가", command=self.add_charge).grid(row=0, column=6, padx=5, pady=5)
+
+        list_frame = ttk.LabelFrame(self.charge_tab, text="충전 내역 목록")
+        list_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        columns = ('id', 'time', 'amount', 'balance')
+        self.charge_tree = ttk.Treeview(list_frame, columns=columns, show='headings')
+
+        for col, txt in zip(columns, ['충전 ID', '충전 시각', '충전 금액 (RP)', '현재 잔액 (RP)']):
+            self.charge_tree.heading(col, text=txt)
+            self.charge_tree.column(col, width=150 if col == 'id' else 180 if col == 'time' else 100)
+
+        self.charge_tree.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.charge_tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.charge_tree.configure(yscrollcommand=scrollbar.set)
+
+        # 복사 및 삭제 버튼
+        btn_frame_tree = ttk.Frame(self.charge_tab)
+        btn_frame_tree.pack(pady=5)
+        ttk.Button(btn_frame_tree, text="선택 복사", command=self.copy_charge_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame_tree, text="선택 삭제", command=self.delete_charge_selected).pack(side=tk.LEFT, padx=5)
+
+        self.update_charge_tree()
+
+    def add_charge(self):
+        """수동으로 충전 내역 추가"""
+        try:
+            charge_id = self.charge_id_entry.get().strip()
+            charge_time_str_raw = self.charge_time_entry.get().strip()
+            charge_time_str = charge_time_str_raw.replace(" KST", "") # KST 제거
+            amount = int(self.charge_amount_entry.get())
+
+            if not charge_id or not charge_time_str_raw or amount <= 0:
+                messagebox.showerror("입력 오류", "모든 충전 정보를 올바르게 입력하세요.")
+                return
+
+            datetime.strptime(charge_time_str, "%Y-%m-%d %H:%M:%S") # 시간 형식 검증
+
+            if any(c[0] == charge_id for c in self.charges):
+                messagebox.showerror("ID 중복", f"충전 ID '{charge_id}'는 이미 존재합니다.")
+                return
+
+            self.charges.append([charge_id, charge_time_str, amount, amount]) # ID, 시각, 금액, 잔액
+            self.update_charge_tree()
+            self.clear_charge_inputs()
+            messagebox.showinfo("성공", "충전 내역이 추가되었습니다.")
+        except ValueError:
+            messagebox.showerror("입력 오류", "시간 형식 또는 금액이 올바르지 않습니다.")
+
+    def clear_charge_inputs(self):
+        """충전 입력 필드 초기화"""
+        self.charge_id_entry.delete(0, tk.END)
+        self.charge_amount_entry.delete(0, tk.END)
+        self.charge_time_entry.delete(0, tk.END)
+        self.charge_time_entry.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M:%S KST"))
+
+    def update_charge_tree(self):
+        """충전 내역 트리뷰 업데이트"""
+        for item in self.charge_tree.get_children():
+            self.charge_tree.delete(item)
+        for charge in self.charges:
+            self.charge_tree.insert('', 'end', values=(charge[0], charge[1], f"{charge[2]} RP", f"{charge[3]} RP"))
+
+    def copy_charge_selected(self):
+        """선택된 충전 내역을 클립보드에 복사"""
+        selected = self.charge_tree.selection()
+        if not selected:
+            messagebox.showwarning("선택 없음", "복사할 항목을 선택하세요.")
+            return
+        rows = []
+        for sel in selected:
+            rows.append('\t'.join(self.charge_tree.item(sel, 'values')))
+        self.root.clipboard_clear()
+        self.root.clipboard_append('\n'.join(rows))
+        messagebox.showinfo("복사 완료", "선택한 충전 내역이 클립보드에 복사되었습니다.")
+
+    def delete_charge_selected(self):
+        """선택된 충전 내역 삭제"""
+        selected = self.charge_tree.selection()
+        if not selected:
+            messagebox.showwarning("선택 없음", "삭제할 항목을 선택하세요.")
+            return
+        if messagebox.askyesno("삭제 확인", "선택한 충전 내역을 삭제하시겠습니까?"):
+            for sel in selected:
+                values = self.charge_tree.item(sel, 'values')
+                self.charges = [c for c in self.charges if c[0] != values[0]]
+            self.update_charge_tree()
+
+    # --- 구매 탭 관련 함수 ---
+    def setup_purchase_tab(self):
+        """구매 내역 탭 UI 구성"""
+        input_frame = ttk.LabelFrame(self.purchase_tab, text="구매 정보 입력")
+        input_frame.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(input_frame, text="구매 ID:").grid(row=0, column=0, padx=5, pady=5)
+        self.purchase_id_entry = ttk.Entry(input_frame, width=20)
+        self.purchase_id_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(input_frame, text="구매 시각 (YYYY-MM-DD HH:MM:SS KST):").grid(row=0, column=2, padx=5, pady=5)
+        self.purchase_time_entry = ttk.Entry(input_frame, width=25)
+        self.purchase_time_entry.grid(row=0, column=3, padx=5, pady=5)
+        self.purchase_time_entry.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M:%S KST"))
+
+        ttk.Label(input_frame, text="구매 금액 (RP):").grid(row=0, column=4, padx=5, pady=5)
+        self.purchase_amount_entry = ttk.Entry(input_frame, width=10)
+        self.purchase_amount_entry.grid(row=0, column=5, padx=5, pady=5)
+
+        ttk.Button(input_frame, text="구매 추가", command=self.add_purchase).grid(row=0, column=6, padx=5, pady=5)
+
+        list_frame = ttk.LabelFrame(self.purchase_tab, text="구매 내역 목록")
+        list_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        columns = ('id', 'time', 'amount', 'used_charges')
+        self.purchase_tree = ttk.Treeview(list_frame, columns=columns, show='headings')
+
+        for col, txt in zip(columns, ['구매 ID', '구매 시각', '구매 금액 (RP)', '사용된 충전 내역']):
+            self.purchase_tree.heading(col, text=txt)
+            self.purchase_tree.column(col, width=150 if col == 'id' else 180 if col == 'time' else 100 if col == 'amount' else 250)
+
+        self.purchase_tree.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.purchase_tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.purchase_tree.configure(yscrollcommand=scrollbar.set)
+
+        btn_frame_tree = ttk.Frame(self.purchase_tab)
+        btn_frame_tree.pack(pady=5)
+        ttk.Button(btn_frame_tree, text="선택 복사", command=self.copy_purchase_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame_tree, text="선택 삭제", command=self.delete_purchase_selected).pack(side=tk.LEFT, padx=5)
+
+        self.update_purchase_tree()
+
+    def add_purchase(self):
+        """수동으로 구매 내역 추가"""
+        try:
+            purchase_id = self.purchase_id_entry.get().strip()
+            purchase_time_str_raw = self.purchase_time_entry.get().strip()
+            purchase_time_str = purchase_time_str_raw.replace(" KST", "")
+            amount = int(self.purchase_amount_entry.get())
+
+            if not purchase_id or not purchase_time_str_raw or amount <= 0:
+                messagebox.showerror("입력 오류", "모든 구매 정보를 올바르게 입력하세요.")
+                return
+
+            datetime.strptime(purchase_time_str, "%Y-%m-%d %H:%M:%S")
+
+            if any(p[0] == purchase_id for p in self.purchases):
+                messagebox.showerror("ID 중복", f"구매 ID '{purchase_id}'는 이미 존재합니다.")
+                return
+
+            self.purchases.append([purchase_id, purchase_time_str, amount, {}])
+            self.update_purchase_tree()
+            self.clear_purchase_inputs()
+            messagebox.showinfo("성공", "구매 내역이 추가되었습니다.")
+        except ValueError:
+            messagebox.showerror("입력 오류", "시간 형식 또는 금액이 올바르지 않습니다.")
+
+    def clear_purchase_inputs(self):
+        """구매 입력 필드 초기화"""
+        self.purchase_id_entry.delete(0, tk.END)
+        self.purchase_amount_entry.delete(0, tk.END)
+        self.purchase_time_entry.delete(0, tk.END)
+        self.purchase_time_entry.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M:%S KST"))
+
+    def update_purchase_tree(self):
+        """구매 내역 트리뷰 업데이트"""
+        for item in self.purchase_tree.get_children():
+            self.purchase_tree.delete(item)
+        for purchase in self.purchases:
+            used_str = ', '.join([f"{cid}: {amt} RP" for cid, amt in purchase[3].items()])
+            self.purchase_tree.insert('', 'end', values=(purchase[0], purchase[1], f"{purchase[2]} RP", used_str))
+
+    def copy_purchase_selected(self):
+        """선택된 구매 내역을 클립보드에 복사"""
+        selected = self.purchase_tree.selection()
+        if not selected:
+            messagebox.showwarning("선택 없음", "복사할 항목을 선택하세요.")
+            return
+        rows = []
+        for sel in selected:
+            rows.append('\t'.join(self.purchase_tree.item(sel, 'values')))
+        self.root.clipboard_clear()
+        self.root.clipboard_append('\n'.join(rows))
+        messagebox.showinfo("복사 완료", "선택한 구매 내역이 클립보드에 복사되었습니다.")
+
+    def delete_purchase_selected(self):
+        """선택된 구매 내역 삭제"""
+        selected = self.purchase_tree.selection()
+        if not selected:
+            messagebox.showwarning("선택 없음", "삭제할 항목을 선택하세요.")
+            return
+        if messagebox.askyesno("삭제 확인", "선택한 구매 내역을 삭제하시겠습니까?"):
+            for sel in selected:
+                values = self.purchase_tree.item(sel, 'values')
+                self.purchases = [p for p in self.purchases if p[0] != values[0]]
+            self.update_purchase_tree()
+
+    # --- 청약철회 탭 관련 함수 ---
+    def setup_refund_tab(self):
+        """청약철회 내역 탭 UI 구성"""
+        input_frame = ttk.LabelFrame(self.refund_tab, text="청약철회 정보 입력")
+        input_frame.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(input_frame, text="청약철회 ID:").grid(row=0, column=0, padx=5, pady=5)
+        self.refund_id_entry = ttk.Entry(input_frame, width=20)
+        self.refund_id_entry.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(input_frame, text="청약철회 시각 (YYYY-MM-DD HH:MM:SS KST):").grid(row=0, column=2, padx=5, pady=5)
+        self.refund_time_entry = ttk.Entry(input_frame, width=25)
+        self.refund_time_entry.grid(row=0, column=3, padx=5, pady=5)
+        self.refund_time_entry.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M:%S KST"))
+
+        ttk.Label(input_frame, text="청약철회 금액 (RP):").grid(row=0, column=4, padx=5, pady=5)
+        self.refund_amount_entry = ttk.Entry(input_frame, width=10)
+        self.refund_amount_entry.grid(row=0, column=5, padx=5, pady=5)
+
+        ttk.Button(input_frame, text="청약철회 추가", command=self.add_refund).grid(row=0, column=6, padx=5, pady=5)
+
+        list_frame = ttk.LabelFrame(self.refund_tab, text="청약철회 내역 목록")
+        list_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        columns = ('id', 'time', 'amount', 'target_purchase_id')
+        self.refund_tree = ttk.Treeview(list_frame, columns=columns, show='headings')
+
+        for col, txt in zip(columns, ['청약철회 ID', '청약철회 시각', '청약철회 금액 (RP)', '대상 구매 ID']):
+            self.refund_tree.heading(col, text=txt)
+            self.refund_tree.column(col, width=150 if col == 'id' else 180 if col == 'time' else 100 if col == 'amount' else 150)
+
+        self.refund_tree.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.refund_tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.refund_tree.configure(yscrollcommand=scrollbar.set)
+
+        btn_frame_tree = ttk.Frame(self.refund_tab)
+        btn_frame_tree.pack(pady=5)
+        ttk.Button(btn_frame_tree, text="선택 복사", command=self.copy_refund_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame_tree, text="선택 삭제", command=self.delete_refund_selected).pack(side=tk.LEFT, padx=5)
+
+        self.update_refund_tree()
+
+    def add_refund(self):
+        try:
+            refund_id = self.refund_id_entry.get().strip()
+            refund_time_str_raw = self.refund_time_entry.get().strip()
+            refund_time_str = refund_time_str_raw.replace(" KST", "")
+            amount = int(self.refund_amount_entry.get())
+
+            if not refund_id or not refund_time_str_raw or amount <= 0:
+                messagebox.showerror("입력 오류", "모든 청약철회 정보를 올바르게 입력하세요.")
+                return
+
+            datetime.strptime(refund_time_str, "%Y-%m-%d %H:%M:%S")
+
+            if any(r[0] == refund_id for r in self.refunds):
+                messagebox.showerror("ID 중복", f"청약철회 ID '{refund_id}'는 이미 존재합니다.")
+                return
+
+            self.refunds.append([refund_id, refund_time_str, amount, ""]) # 대상 구매 ID는 수동 입력 시 빈 값
+            self.update_refund_tree()
+            self.clear_refund_inputs()
+            messagebox.showinfo("성공", "청약철회 내역이 추가되었습니다.")
+        except ValueError:
+            messagebox.showerror("입력 오류", "시간 형식 또는 금액이 올바르지 않습니다.")
+
+    def clear_refund_inputs(self):
+        self.refund_id_entry.delete(0, tk.END)
+        self.refund_amount_entry.delete(0, tk.END)
+        self.refund_time_entry.delete(0, tk.END)
+        self.refund_time_entry.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M:%S KST"))
+
+    def update_refund_tree(self):
+        for item in self.refund_tree.get_children():
+            self.refund_tree.delete(item)
+        for refund in self.refunds:
+            self.refund_tree.insert('', 'end', values=(refund[0], refund[1], f"{refund[2]} RP", refund[3]))
+
+    def copy_refund_selected(self):
+        selected = self.refund_tree.selection()
+        if not selected:
+            messagebox.showwarning("선택 없음", "복사할 항목을 선택하세요.")
+            return
+        rows = []
+        for sel in selected:
+            rows.append('\t'.join(self.refund_tree.item(sel, 'values')))
+        self.root.clipboard_clear()
+        self.root.clipboard_append('\n'.join(rows))
+        messagebox.showinfo("복사 완료", "선택한 청약철회 내역이 클립보드에 복사되었습니다.")
+
+    def delete_refund_selected(self):
+        selected = self.refund_tree.selection()
+        if not selected:
+            messagebox.showwarning("선택 없음", "삭제할 항목을 선택하세요.")
+            return
+        if messagebox.askyesno("삭제 확인", "선택한 청약철회 내역을 삭제하시겠습니까?"):
+            for sel in selected:
+                values = self.refund_tree.item(sel, 'values')
+                self.refunds = [r for r in self.refunds if r[0] != values[0]]
+            self.update_refund_tree()
+
+    # --- 결과 탭 관련 함수 ---
+    def setup_result_tab(self):
+        self.result_text = tk.Text(self.result_tab, wrap=tk.WORD, height=15)
+        self.result_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        scrollbar = ttk.Scrollbar(self.result_text, orient="vertical", command=self.result_text.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.result_text.config(yscrollcommand=scrollbar.set)
+
+    # --- 자동 연산 탭 관련 함수 ---
+    def setup_bulk_input_tab(self):
+        input_frame = ttk.LabelFrame(self.bulk_input_tab, text="자동 연산 (메모장/스프레드시트 복사-붙여넣기)")
+        input_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.bulk_text_input = tk.Text(input_frame, wrap=tk.WORD, height=20)
+        self.bulk_text_input.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        ttk.Button(input_frame, text="연산 시작", command=self.process_bulk_input).pack(pady=5)
+
+    def process_bulk_input(self):
+        bulk_data = self.bulk_text_input.get("1.0", tk.END).strip()
+        if not bulk_data:
+            messagebox.showwarning("입력 없음", "일괄 입력할 데이터가 없습니다.")
+            return
+
+        lines = bulk_data.split('\n')
+
+        new_charges = []
+        new_purchases = []
+        new_refunds = []
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            parts = line.split('\t')
+
+            # 필드 개수를 4개로 가정하고, 부족하면 채움 (최소 4개 필드)
+            while len(parts) < 4:
+                parts.append("")
+
+            # 각 필드 공백 제거
+            parts = [p.strip() for p in parts]
+
+            try:
+                # 필드 해석을 유연하게 변경
+                time_str_raw = ""
+                potential_time_idx = -1
+                for i, part in enumerate(parts):
+                    if len(part) >= 19 and part[4] == '-' and part[13] == ':': # YYYY-MM-DD HH:MM:SS 패턴 대략 확인
+                        time_str_raw = part
+                        potential_time_idx = i
+                        break
+
+                if not time_str_raw:
+                    raise ValueError("시간 필드를 찾을 수 없습니다.")
+
+                time_str = time_str_raw.replace(" KST", "").strip()
+
+                amount_str = ""
+                potential_amount_idx = -1
+                for i, part in enumerate(parts):
+                    if part.replace(',', '').replace('-', '').isdigit(): # 숫자로만 구성된 필드
+                        amount_str = part
+                        potential_amount_idx = i
+                        break
+                
+                if not amount_str:
+                    raise ValueError("금액 필드를 찾을 수 없습니다.")
+
+                amount = int(amount_str.replace(",", ""))
+
+                item_id = parts[0]
+
+                item_type_raw = ""
+                # 시간과 금액을 제외한 나머지 필드 중 키워드 포함 가능성 있는 필드
+                for i, part in enumerate(parts):
+                    if i != potential_time_idx and i != potential_amount_idx:
+                        item_type_raw += part + " "
+                item_type_raw = item_type_raw.strip()
+
+                # '기존 보유 재화' 라인 특별 처리
+                if item_id == "기존 보유 재화":
+                    charge_id = "기존 보유 재화"
+                    if any(c[0] == charge_id for c in self.charges):
+                        continue
+                    new_charges.append([charge_id, time_str, abs(amount), abs(amount)])
+                    continue
+
+                # 1. 충전 내역 분류 (LK로 시작하는 ID 또는 store-purchase-USER_PURCHASED_RP 포함)
+                if (item_id.startswith("LK") and len(item_id) > 2) or "store-purchase-USER_PURCHASED_RP" in item_type_raw:
+                    if any(c[0] == item_id for c in self.charges):
+                        messagebox.showwarning("ID 중복", f"충전 ID '{item_id}'는 이미 존재합니다. 건너킵니다.")
+                        continue
+                    new_charges.append([item_id, time_str, abs(amount), abs(amount)])
+                # 2. 구매 내역 분류 (store-purchase-PURCHASE 또는 cap.orders 또는 '구매' 키워드 포함, REFUND/청약철회 제외)
+                elif ("store-purchase-PURCHASE" in item_type_raw or "cap.orders" in item_type_raw or "구매" in item_type_raw) and \
+                     "store-purchase-REFUND" not in item_type_raw and "청약철회" not in item_type_raw:
+                    if any(p[0] == item_id for p in self.purchases):
+                        messagebox.showwarning("ID 중복", f"구매 ID '{item_id}'는 이미 존재합니다. 건너뜁니다.")
+                        continue
+                    new_purchases.append([item_id, time_str, abs(amount), {}])
+                # 3. 청약철회 내역 분류 (store-purchase-REFUND 또는 '청약철회' 키워드 포함)
+                elif "store-purchase-REFUND" in item_type_raw or "청약철회" in item_type_raw:
+                    if any(r[0] == item_id for r in self.refunds):
+                        messagebox.showwarning("ID 중복", f"청약철회 ID '{item_id}'는 이미 존재합니다. 건너뜁니다.")
+                        continue
+
+                    target_purchase_id = ""
+                    if any(p[0] == item_id for p in self.purchases):
+                        target_purchase_id = item_id
+                    new_refunds.append([item_id, time_str, abs(amount), target_purchase_id])
+                else:
+                    messagebox.showwarning("알 수 없는 타입", f"알 수 없는 타입입니다 (라인: {line})")
+                    continue
+
+            except ValueError as ve:
+                messagebox.showerror("파싱 오류", f"데이터 형식 오류: {line}\n오류: {ve}")
+                continue
+            except Exception as e:
+                messagebox.showerror("파싱 오류", f"데이터 파싱 중 알 수 없는 오류 발생: {line}\n오류: {e}")
+                continue
+
+        self.charges.extend(new_charges)
+        self.purchases.extend(new_purchases)
+        self.refunds.extend(new_refunds)
+
+        self.update_charge_tree()
+        self.update_purchase_tree()
+        self.update_refund_tree()
+        messagebox.showinfo("파싱 완료", f"{len(new_charges)}개 충전, {len(new_purchases)}개 구매, {len(new_refunds)}개 청약철회 내역이 추가되었습니다.")
+        self.bulk_text_input.delete("1.0", tk.END)
+
+    # --- 선입선출 계산 및 기타 기능 ---
+    def clear_all_data(self):
+        if messagebox.askyesno("데이터 초기화", "모든 입력된 데이터를 초기화하시겠습니까? (저장된 파일은 삭제되지 않습니다.)"):
+            self.charges = []
+            self.purchases = []
+            self.refunds = []
+            self.update_charge_tree()
+            self.update_purchase_tree()
+            self.update_refund_tree()
+            self.result_text.delete('1.0', tk.END)
+            messagebox.showinfo("초기화 완료", "모든 데이터가 초기화되었습니다.")
+
+    def calculate_fifo_threaded(self):
+        threading.Thread(target=self.calculate_fifo, daemon=True).start()
+
+    def calculate_fifo(self):
+        all_events = []
+        for c in self.charges:
+            all_events.append({'type': 'charge', 'id': c[0], 'time': datetime.strptime(c[1], "%Y-%m-%d %H:%M:%S"), 'amount': c[2]})
+        for p in self.purchases:
+            all_events.append({'type': 'purchase', 'id': p[0], 'time': datetime.strptime(p[1], "%Y-%m-%d %H:%M:%S"), 'amount': p[2]})
+        for r in self.refunds:
+            all_events.append({'type': 'refund', 'id': r[0], 'time': datetime.strptime(r[1], "%Y-%m-%d %H:%M:%S"), 'amount': r[2], 'target_purchase_id': r[3]})
+
+        all_events.sort(key=lambda x: x['time'])
+
+        charge_balances = {c[0]: c[2] for c in self.charges}
+        charge_time_map = {c[0]: datetime.strptime(c[1], "%Y-%m-%d %H:%M:%S") for c in self.charges}
+        purchase_used_charges = {p[0]: {} for p in self.purchases}
+
+        log_output = "--- 선입선출 계산 로그 ---\n"
+
+        for event in all_events:
+            log_output += f"\n[{event['time'].strftime('%Y-%m-%d %H:%M:%S')}] {event['type'].upper()} - ID: {event['id']}\n"
+
+            if event['type'] == 'charge':
+                log_output += f"  > 충전 '{event['id']}' {event['amount']} RP 추가. 현재 잔액: {charge_balances.get(event['id'], event['amount'])} RP\n"
+
+            elif event['type'] == 'purchase':
+                current_purchase_amount = event['amount']
+                remaining_to_deduct = current_purchase_amount
+
+                sorted_available_charges = sorted([
+                    (c_id, balance) for c_id, balance in charge_balances.items() if balance > 0
+                ], key=lambda item: charge_time_map.get(item[0], datetime.min))
+
+                log_output += f"  > 구매 '{event['id']}' {current_purchase_amount} RP 시도.\n"
+
+                for charge_id, available_balance in sorted_available_charges:
+                    if remaining_to_deduct <= 0:
+                        break
+
+                    deduct_amount = min(remaining_to_deduct, available_balance)
+
+                    charge_balances[charge_id] -= deduct_amount
+                    remaining_to_deduct -= deduct_amount
+
+                    if event['id'] not in purchase_used_charges:
+                        purchase_used_charges[event['id']] = {}
+                    if charge_id not in purchase_used_charges[event['id']]:
+                        purchase_used_charges[event['id']][charge_id] = 0
+                    purchase_used_charges[event['id']][charge_id] += deduct_amount
+
+                    log_output += f"    - 충전 '{charge_id}'에서 {deduct_amount} RP 차감. 남은 잔액: {charge_balances[charge_id]} RP\n"
+
+                if remaining_to_deduct > 0:
+                    log_output += f"    - 경고: 구매 '{event['id']}' {current_purchase_amount} RP 중 {remaining_to_deduct} RP 부족!\n"
+
+            elif event['type'] == 'refund':
+                refund_amount = event['amount']
+                target_purchase_id = event['target_purchase_id']
+
+                log_output += f"  > 청약철회 '{event['id']}' {refund_amount} RP 시도 (대상 구매: {target_purchase_id}).\n"
+
+                target_purchase_record_found = False
+                for p in self.purchases:
+                    if p[0] == target_purchase_id:
+                        target_purchase_record_found = True
+                        break
+
+                if not target_purchase_record_found:
+                    log_output += f"    - 오류: 대상 구매 ID '{target_purchase_id}'를 찾을 수 없어 청약철회 처리 불가.\n"
+                    continue
+
+                used_charges_for_refund = purchase_used_charges.get(target_purchase_id, {})
+                sorted_used_charges = sorted(used_charges_for_refund.items(), key=lambda item: item[1], reverse=True)
+
+                remaining_to_refund = refund_amount
+
+                for charge_id, used_amount_in_purchase in sorted_used_charges:
+                    if remaining_to_refund <= 0:
+                        break
+
+                    restore_amount = min(remaining_to_refund, used_amount_in_purchase)
+
+                    charge_balances[charge_id] += restore_amount
+                    remaining_to_refund -= restore_amount
+
+                    used_charges_for_refund[charge_id] -= restore_amount
+
+                    log_output += f"    - 충전 '{charge_id}'에 {restore_amount} RP 복원. 현재 잔액: {charge_balances[charge_id]} RP\n"
+
+                if remaining_to_refund > 0:
+                    log_output += f"    - 경고: 청약철회 '{event['id']}' {refund_amount} RP 중 {remaining_to_refund} RP 처리 불가. (이미 다른 구매/청약철회로 소진되었거나 원본 부족)\n"
+
+        self.root.after(0, lambda: self.update_result_text(log_output, charge_balances, charge_time_map, purchase_used_charges))
+
+    def update_result_text(self, log_output, charge_balances, charge_time_map, purchase_used_charges):
+        self.result_text.delete('1.0', tk.END)
+        self.result_text.insert(tk.END, log_output)
+        self.result_text.insert(tk.END, "\n--- 최종 재화 잔액 ---\n")
+
+        final_total_balance = 0
+
+        sorted_final_charges = sorted([
+            (c_id, balance) for c_id, balance in charge_balances.items()
+        ], key=lambda item: charge_time_map.get(item[0], datetime.min), reverse=True)
+
+        for charge_id, balance in sorted_final_charges:
+            self.result_text.insert(tk.END, f"충전 ID '{charge_id}': {balance} RP\n")
+            final_total_balance += balance
+
+        self.result_text.insert(tk.END, f"\n총 잔액: {final_total_balance} RP\n")
+
+        for p_idx, p_data in enumerate(self.purchases):
+            p_id = p_data[0]
+            if p_id in purchase_used_charges:
+                self.purchases[p_idx][3] = purchase_used_charges[p_id]
+        self.update_purchase_tree()
+
+        for i, charge_item in enumerate(self.charges):
+            charge_item[3] = charge_balances.get(charge_item[0], 0)
+        self.update_charge_tree()
+
+        messagebox.showinfo("계산 완료", "선입선출 계산이 완료되었습니다. '결과 확인' 탭을 확인하세요.")
+
+    # --- 데이터 저장/불러오기 ---
+    def save_data(self):
+        data = {
+            'charges': self.charges,
+            'purchases': self.purchases,
+            'refunds': self.refunds
+        }
+        try:
+            user_docs = os.path.join(os.path.expanduser('~'), 'Documents')
+            app_folder = os.path.join(user_docs, 'FIFO계산기')
+            if not os.path.exists(app_folder):
+                os.makedirs(app_folder)
+            file_path = os.path.join(app_folder, 'fifo_data.json')
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            messagebox.showinfo("저장 완료", f"데이터가 '{file_path}' 파일에 저장되었습니다.")
+        except Exception as e:
+            error_msg = f"데이터 저장 중 오류 발생: {e}"
+            messagebox.showerror("저장 오류", error_msg)
+            print(error_msg)
+
+    def load_data(self):
+        try:
+            user_docs = os.path.join(os.path.expanduser('~'), 'Documents')
+            app_folder = os.path.join(user_docs, 'FIFO계산기')
+            file_path = os.path.join(app_folder, 'fifo_data.json')
+            if os.path.exists(file_path):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.charges = data.get('charges', [])
+                    self.purchases = data.get('purchases', [])
+                    self.refunds = data.get('refunds', [])
+                self.update_charge_tree()
+                self.update_purchase_tree()
+                self.update_refund_tree()
+                messagebox.showinfo("불러오기 완료", "데이터를 성공적으로 불러왔습니다.")
+            else:
+                pass
+        except Exception as e:
+            error_msg = f"데이터 불러오기 중 오류 발생: {e}"
+            messagebox.showerror("불러오기 오류", error_msg)
+            print(error_msg)
+
+# 프로그램 실행 진입점
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = FIFOCalculator(root)
+    root.mainloop()
